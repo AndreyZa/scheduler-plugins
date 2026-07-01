@@ -42,6 +42,9 @@ EXTRA_ARGS=""
 # v20200521-v0.18.800             - automated build for a tag
 VERSION=$(shell echo $(RELEASE_VERSION) | awk -F - '{print $$2}')
 VERSION:=$(or $(VERSION),v0.0.$(shell date +%Y%m%d))
+DEV_VERSION ?= v1.35.0
+DEV_IMAGE ?= localhost:5000/scheduler-plugins/kube-scheduler:dev
+DEV_GOARCH ?= $(shell go env GOARCH)
 
 .PHONY: all
 all: build
@@ -108,3 +111,14 @@ verify:
 .PHONY: clean
 clean:
 	rm -rf ./bin
+
+.PHONY: dev-image
+dev-image: 
+	GOOS=linux GOARCH=$(DEV_GOARCH) go build \
+		-ldflags '-X k8s.io/component-base/version.gitVersion=$(DEV_VERSION) -w' \
+		-o bin/kube-scheduler cmd/scheduler/main.go
+	docker build --no-cache -t $(DEV_IMAGE) -f Dockerfile.dev .
+
+.PHONY: dev-redeploy
+dev-redeploy: dev-image
+	kubectl delete pod -n kube-system -l app=my-scheduler --ignore-not-found
