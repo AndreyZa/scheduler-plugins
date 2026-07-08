@@ -25,8 +25,8 @@ fmt: ## gofmt -w по пакету плагина
 vet: ## go vet по пакету плагина
 	go vet $(PLUGIN_PKG)
 
-.PHONY: build-ss
-build-ss: fmt vet ## Собрать пакет плагина локально (без Docker-образа) — быстрая проверка компиляции
+.PHONY: dev-build
+dev-build: fmt vet ## Собрать пакет плагина локально (без Docker-образа) — быстрая проверка компиляции
 	go build $(PLUGIN_PKG)
 
 .PHONY: test
@@ -35,7 +35,7 @@ test: ## Юнит-тесты плагина
 
 .PHONY: dev-image
 dev-image:
-	GOOS=linux GOARCH=$(DEV_GOARCH) go build \
+	CGO_ENABLED=0 GOOS=linux GOARCH=$(DEV_GOARCH) go build \
 		-ldflags '-X k8s.io/component-base/version.gitVersion=$(K8S_VERSION) -w' \
 		-o bin/kube-scheduler cmd/scheduler/main.go
 	docker build --no-cache -t $(DEV_IMAGE) -f Dockerfile.dev .
@@ -48,3 +48,8 @@ dev-push:
 
 .PHONY: dev-release
 dev-release: dev-image dev-push
+
+.PHONY: image-purge
+image-purge: ## Удалить локальный образ плагина (для dev-build/dev-release)
+	docker rmi -f $(DEV_IMAGE) || true
+	docker rmi -f $(DEV_REGISTRY):latest || true
