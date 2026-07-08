@@ -122,3 +122,5 @@ dev-image:
 .PHONY: dev-redeploy
 dev-redeploy: dev-image
 	kubectl delete pod -n kube-system -l app=my-scheduler --ignore-not-found
+
+include sensitivityscore.mk
