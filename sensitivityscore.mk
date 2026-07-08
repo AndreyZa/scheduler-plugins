@@ -42,7 +42,9 @@ dev-image:
 
 .PHONY: dev-push
 dev-push:
+	docker tag $(DEV_IMAGE) $(DEV_REGISTRY):latest
 	docker push $(DEV_IMAGE)
+	docker push $(DEV_REGISTRY):latest
 
 .PHONY: dev-release
 dev-release: dev-image dev-push
