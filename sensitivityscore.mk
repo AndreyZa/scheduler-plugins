@@ -4,8 +4,8 @@ PLUGIN_DIR ?= pkg/sensitivityscore
 PLUGIN_PKG ?= ./$(PLUGIN_DIR)/...
 
 DEV_REGISTRY    ?= andreyza/sensitivityscore
-DEV_VERSION     ?= v$(shell date +%Y%m%d)-$(shell git describe --tags --match "v*")
-DEV_IMAGE       ?= localhost:5000/scheduler-plugins/sensitivityscore:$(DEV_VERSION)
+DEV_VERSION     ?= v$(shell date +%Y%m%d)-$(shell git rev-parse --short HEAD)
+DEV_IMAGE       ?= $(DEV_REGISTRY):$(DEV_VERSION)
 K8S_VERSION     ?= v1.35.0
 DEV_GOARCH      ?= $(shell go env GOARCH)
 
@@ -42,8 +42,7 @@ dev-image:
 
 .PHONY: dev-push
 dev-push:
-	docker tag $(DEV_IMAGE) $(DEV_REGISTRY):$(DEV_VERSION)
-	docker push $(DEV_REGISTRY):$(DEV_VERSION)
+	docker push $(DEV_IMAGE)
 
 .PHONY: dev-release
 dev-release: dev-image dev-push
