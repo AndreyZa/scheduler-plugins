@@ -23,8 +23,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/watch"
 
-	"k8s.io/klog/v2"
-
+	"github.com/go-logr/logr/testr"
 	topologyv1alpha2 "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha2"
 )
 
@@ -135,9 +134,10 @@ func TestWatcherProcessEvent(t *testing.T) {
 		},
 	}
 
+	logger := testr.New(t)
 	wt := Watcher{
-		lh:    klog.Background(),
-		nrts:  newNrtStore(klog.Background(), nrts),
+		lh:    logger,
+		nrts:  newNrtStore(logger, nrts),
 		nodes: newCounter(),
 	}
 

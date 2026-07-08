@@ -19,11 +19,11 @@ package cache
 import (
 	"testing"
 
+	"github.com/go-logr/logr/testr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/klog/v2"
 )
 
 func TestIsForeignPod(t *testing.T) {
@@ -250,7 +250,7 @@ func TestIsForeignPod(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			for _, profileName := range tt.profileNames {
-				RegisterSchedulerProfileName(klog.Background(), profileName)
+				RegisterSchedulerProfileName(testr.New(t), profileName)
 			}
 			defer CleanRegisteredSchedulerProfileNames()
 			defer TrackAllForeignPods()
