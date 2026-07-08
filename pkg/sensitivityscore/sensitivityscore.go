@@ -136,10 +136,10 @@ func (s *SensitivityScore) Score(
 
 	// Взвешенное скалярное произведение профиля job и давления ноды по тем
 	// же 4 измерениям — чем выше произведение, тем больше риск интерференции.
-	interference := jobProfile.llc*pressure.LLC*w.LLC +
-		jobProfile.numa*pressure.NUMA*w.NUMA +
-		jobProfile.net*pressure.Net*w.Net +
-		jobProfile.io*pressure.IO*w.IO
+	interference := jobProfile.LLC*pressure.LLC*w.LLC +
+		jobProfile.NUMA*pressure.NUMA*w.NUMA +
+		jobProfile.Net*pressure.Net*w.Net +
+		jobProfile.IO*pressure.IO*w.IO
 
 	// Знаменатель — теоретический максимум при всех измерениях = 1.0
 	// (сумма весов * 100, т.к. pressure в шкале 0-100). Даёт нормировку в
@@ -170,9 +170,15 @@ func (s *SensitivityScore) ScoreExtensions() fwk.ScoreExtensions {
 }
 
 // sensitivityVector - S_job = (llc, numa, net, io) ∈ [0,1]^4, распарсенный
-// из аннотаций пода.
+// из аннотаций пода. Поля публичные (с json-тегами, как у nodePressure) —
+// иначе структурное логирование klog (использует encoding/json для
+// нестроковых значений) молча отбрасывает непубличные поля и печатает
+// пустой jobProfile={} в логах, что и произошло в первой версии этого файла.
 type sensitivityVector struct {
-	llc, numa, net, io float64
+	LLC  float64 `json:"llc"`
+	NUMA float64 `json:"numa"`
+	Net  float64 `json:"net"`
+	IO   float64 `json:"io"`
 }
 
 // extractSensitivityVector читает аннотации scheduling.phd/sensitivity-*
@@ -191,10 +197,10 @@ func extractSensitivityVector(annotations map[string]string) sensitivityVector {
 		}
 	}
 	return sensitivityVector{
-		llc:  get(annoLLC),
-		numa: get(annoNUMA),
-		net:  get(annoNet),
-		io:   get(annoIO),
+		LLC:  get(annoLLC),
+		NUMA: get(annoNUMA),
+		Net:  get(annoNet),
+		IO:   get(annoIO),
 	}
 }
 
