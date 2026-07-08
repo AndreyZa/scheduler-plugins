@@ -1,3 +1,4 @@
 FROM gcr.io/distroless/static:nonroot
 COPY bin/kube-scheduler /bin/kube-scheduler
+USER 65532:65532
 ENTRYPOINT ["/bin/kube-scheduler"]
