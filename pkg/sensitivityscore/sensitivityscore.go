@@ -131,11 +131,25 @@ func (s *SensitivityScore) Score(
 	nodeName := nodeInfo.Node().Name
 
 	s.mu.RLock()
-	pressure := s.metrics[nodeName] // нулевой nodePressure, если данных для ноды ещё нет
+	pressure, known := s.metrics[nodeName]
 	w := s.weights
 	s.mu.RUnlock()
 
 	jobProfile := extractSensitivityVector(pod.Annotations)
+
+	if !known {
+		// Нода без свежих метрик (агент на ней не пишет, или node:metrics
+		// истёк по TTL). Раньше такая нода получала нулевое давление и,
+		// как следствие, максимальный score — т.е. все чувствительные поды
+		// стягивались ровно на ту ноду, где метрик-пайплайн сломан.
+		// Нейтральная середина шкалы не выделяет её ни в лучшую, ни в
+		// худшую сторону: выбор отдаётся нодам с известным давлением и
+		// остальным плагинам score-фазы.
+		neutral := (fwk.MinNodeScore + fwk.MaxNodeScore) / 2
+		klog.InfoS("SensitivityScore.Score: no fresh metrics for node, neutral score",
+			"pod", pod.Name, "node", nodeName, "score", neutral)
+		return neutral, nil
+	}
 
 	// Взвешенное скалярное произведение профиля job и давления ноды по тем
 	// же 4 измерениям — чем выше произведение, тем больше риск интерференции.
