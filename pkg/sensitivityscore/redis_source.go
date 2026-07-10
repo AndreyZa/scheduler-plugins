@@ -17,13 +17,18 @@ const redisNodeMetricsKeyPrefix = "node:metrics:"
 
 // redisMetricsSource reads the current PressureVector for every node from
 // Redis, replacing the MVP's single node-metrics.json file. The agent writes
-// each dimension already normalized to [0,1] (docs §3.1: "нормализовать в
-// единый PressureVector перед записью в Redis"): LLC as miss ratio, IO as
-// the PSI io.pressure stall share (field io_pressure — NOT raw io_iops,
-// which has no honest [0,1] scale without a per-device max-IOPS calibration
-// and is kept for analysis only). loadAll converts that to this package's
-// existing 0-100 pressure scale, defensively clamping to [0,1] first so one
-// bad upstream value can't blow up the score's dot product.
+// each dimension already normalized to [0,1] where that's honest (docs §3.1:
+// "нормализовать в единый PressureVector перед записью в Redis"): LLC as
+// miss ratio, IO as the PSI io.pressure stall share (field io_pressure — NOT
+// raw io_iops, which has no honest [0,1] scale without a per-device
+// max-IOPS calibration). Net has the identical problem one level up: raw
+// net_bw is bytes/sec with no per-NIC bandwidth calibration, and cgroup v2
+// has no network-PSI equivalent to borrow (PSI only covers cpu/io/memory) —
+// so it stays out of the score entirely (nodePressure.Net is always 0) until
+// a stand-specific bandwidth reference is defined; net_bw is still written
+// to Redis and kept for analysis. loadAll converts what IS scored to this
+// package's existing 0-100 pressure scale, defensively clamping to [0,1]
+// first so one bad upstream value can't blow up the score's dot product.
 type redisMetricsSource struct {
 	rdb *redis.Client
 }
@@ -53,8 +58,9 @@ func (r *redisMetricsSource) loadAll(ctx context.Context) (nodeMetrics, error) {
 		out[nodeName] = nodePressure{
 			LLC:  parsePressureField(fields["llc_miss_rate"]) * 100,
 			NUMA: parsePressureField(fields["numa_remote_ratio"]) * 100,
-			Net:  parsePressureField(fields["net_bw"]) * 100,
-			IO:   parsePressureField(fields["io_pressure"]) * 100,
+			// Net: intentionally not read — see this file's package-level
+			// doc comment (raw net_bw has no honest [0,1] scale yet).
+			IO: parsePressureField(fields["io_pressure"]) * 100,
 		}
 	}
 	if err := iter.Err(); err != nil {
