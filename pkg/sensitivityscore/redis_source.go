@@ -18,12 +18,12 @@ const redisNodeMetricsKeyPrefix = "node:metrics:"
 // redisMetricsSource reads the current PressureVector for every node from
 // Redis, replacing the MVP's single node-metrics.json file. The agent writes
 // each dimension already normalized to [0,1] (docs §3.1: "нормализовать в
-// единый PressureVector перед записью в Redis"); loadAll converts that to
-// this package's existing 0-100 pressure scale and defensively clamps to
-// [0,1] first, since io_iops in particular isn't fully normalized upstream
-// yet (metrics-agent/cmd/agent/main.go writes raw IOPS counts) — a clamp
-// here just prevents one node's unnormalized upstream value from blowing up
-// the score's dot product, it doesn't fix the underlying normalization gap.
+// единый PressureVector перед записью в Redis"): LLC as miss ratio, IO as
+// the PSI io.pressure stall share (field io_pressure — NOT raw io_iops,
+// which has no honest [0,1] scale without a per-device max-IOPS calibration
+// and is kept for analysis only). loadAll converts that to this package's
+// existing 0-100 pressure scale, defensively clamping to [0,1] first so one
+// bad upstream value can't blow up the score's dot product.
 type redisMetricsSource struct {
 	rdb *redis.Client
 }
@@ -54,7 +54,7 @@ func (r *redisMetricsSource) loadAll(ctx context.Context) (nodeMetrics, error) {
 			LLC:  parsePressureField(fields["llc_miss_rate"]) * 100,
 			NUMA: parsePressureField(fields["numa_remote_ratio"]) * 100,
 			Net:  parsePressureField(fields["net_bw"]) * 100,
-			IO:   parsePressureField(fields["io_iops"]) * 100,
+			IO:   parsePressureField(fields["io_pressure"]) * 100,
 		}
 	}
 	if err := iter.Err(); err != nil {
