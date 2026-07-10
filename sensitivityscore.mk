@@ -3,9 +3,9 @@ SHELL := /bin/bash
 PLUGIN_DIR ?= pkg/sensitivityscore
 PLUGIN_PKG ?= ./$(PLUGIN_DIR)/...
 
-DEV_REGISTRY    ?= andreyza/sensitivityscore
-DEV_VERSION     ?= v$(shell date +%Y%m%d)-$(shell git rev-parse --short HEAD)
-DEV_IMAGE       ?= $(DEV_REGISTRY):$(DEV_VERSION)
+REGISTRY        ?= andreyza
+RELEASE_VERSION ?= v$(shell date +%Y%m%d)-$(shell git rev-parse --short HEAD)
+DEV_IMAGE       ?= $(REGISTRY)/sensitivityscore:$(RELEASE_VERSION)
 K8S_VERSION     ?= v1.35.0
 DEV_GOARCH      ?= $(shell go env GOARCH)
 
@@ -25,29 +25,28 @@ fmt: ## gofmt -w по пакету плагина
 vet: ## go vet по пакету плагина
 	go vet $(PLUGIN_PKG)
 
-.PHONY: dev-build
-dev-build: fmt vet ## Собрать пакет плагина локально (без Docker-образа) — быстрая проверка компиляции
+.PHONY: ss-build
+ss-build: fmt vet ## Собрать пакет плагина локально (без Docker-образа) — быстрая проверка компиляции
 	go build $(PLUGIN_PKG)
 
-.PHONY: test
-test: ## Юнит-тесты плагина
+.PHONY: ss-test
+ss-test: ## Юнит-тесты плагина
 	go test -v -count=1 $(PLUGIN_PKG)
 
-.PHONY: dev-image
-dev-image:
+.PHONY: ss-image
+ss-image: ## Собрать Docker-образ плагина -> $(DEV_IMAGE)
 	CGO_ENABLED=0 GOOS=linux GOARCH=$(DEV_GOARCH) go build \
 		-ldflags '-X k8s.io/component-base/version.gitVersion=$(K8S_VERSION) -w' \
 		-o bin/kube-scheduler cmd/scheduler/main.go
 	docker build --no-cache -t $(DEV_IMAGE) -f Dockerfile.dev .
 
-.PHONY: dev-push
-dev-push:
+.PHONY: ss-push
+ss-push: ## Запушить образ плагина в registry
 	docker push $(DEV_IMAGE)
 
-.PHONY: dev-release
-dev-release: dev-image dev-push
+.PHONY: ss-release
+ss-release: ss-image ss-push ## ss-image + ss-push
 
-.PHONY: image-purge
-image-purge: ## Удалить локальный образ плагина (для dev-build/dev-release)
+.PHONY: ss-purge
+ss-purge: ## Удалить локальный образ плагина (для ss-image/ss-release)
 	docker rmi -f $(DEV_IMAGE) || true
-	docker rmi -f $(DEV_REGISTRY):latest || true

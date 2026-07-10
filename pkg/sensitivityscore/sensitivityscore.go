@@ -20,10 +20,13 @@ limitations under the License.
 // Z = {G, R, S} from the dissertation, where S = (LLC, NUMA, Net, IO) ∈ [0,1]^4.
 //
 // This is a direct extension of the working MVP (single "noise" scalar +
-// JSON-file reload) to the full four-dimensional sensitivity vector. The
-// reload mechanism (ticker + os.ReadFile + json.Unmarshal, no fsnotify) is
-// kept unchanged on purpose — it's the part that was already proven to build
-// and run; only the scoring math and the on-disk schema grew.
+// JSON-file reload) to the full four-dimensional sensitivity vector. Node
+// pressure now comes from Redis (metrics-agent's node:metrics:<node> hashes,
+// docs §3.2) instead of the MVP's node-metrics.json ConfigMap file — see
+// redis_source.go — but the reload-on-a-ticker structure is unchanged, and
+// weights still come from a ConfigMap file (weightsFilePath below) since
+// ablation runs (docs §2.1: "что если убрать NUMA из score") are meant to be
+// a ConfigMap edit, unrelated to the live metrics pipeline.
 package sensitivityscore
 
 import (
@@ -51,10 +54,13 @@ const (
 	annoIO   = "scheduling.phd/sensitivity-io"
 )
 
-// metricsFilePath - путь к файлу с метриками загрузки нод, монтируется через
-// ConfigMap. Формат JSON расширен с одного числа на объект с 4 полями —
-// см. schema ниже.
-const metricsFilePath = "/etc/sensitivity/node-metrics.json"
+// redisAddrEnv - адрес Redis для чтения node:metrics:* (тот же backend, куда
+// пишет metrics-agent, см. REDIS_ADDR в metrics-agent/cmd/agent/main.go).
+const redisAddrEnv = "REDIS_ADDR"
+
+// defaultRedisAddr используется, если redisAddrEnv не задан — тот же дефолт,
+// что и у агента.
+const defaultRedisAddr = "redis.sensitivityscore-system.svc.cluster.local:6379"
 
 // weightsFilePath - путь к файлу с весами измерений S, тоже монтируется через
 // ConfigMap, тоже перечитывается тем же тикером. Отдельный файл, а не часть
@@ -76,13 +82,9 @@ type nodePressure struct {
 	IO   float64 `json:"io"`
 }
 
-// nodeMetrics - формат записи в JSON-файле метрик: имя ноды -> nodePressure.
-// Пример файла:
-//
-//	{
-//	  "node-1": {"llc": 20, "numa": 10, "net": 5,  "io": 0},
-//	  "node-2": {"llc": 80, "numa": 60, "net": 10, "io": 5}
-//	}
+// nodeMetrics - имя ноды -> nodePressure, загружается из Redis
+// (node:metrics:<node> hashes, см. redis_source.go) на каждый тик
+// refreshLoop.
 type nodeMetrics map[string]nodePressure
 
 // weights - вес каждого измерения в скор-функции, [0, +inf). Хранится
@@ -100,11 +102,12 @@ func defaultWeights() weights {
 	return weights{LLC: 1.0, NUMA: 1.0, Net: 1.0, IO: 1.0}
 }
 
-// SensitivityScore - плагин с in-memory кэшем метрик и весов, оба
-// обновляются периодическим перечитыванием файлов (тот же механизм, что и в
-// MVP — без сетевых вызовов на пути Score()).
+// SensitivityScore - плагин с in-memory кэшем метрик и весов; метрики берутся
+// из Redis, веса — из файла, оба обновляются периодическим тикером (Score()
+// сам никогда не делает сетевых вызовов — читает только кэш).
 type SensitivityScore struct {
 	handle fwk.Handle
+	redis  *redisMetricsSource
 
 	mu      sync.RWMutex
 	metrics nodeMetrics
@@ -205,12 +208,19 @@ func extractSensitivityVector(annotations map[string]string) sensitivityVector {
 }
 
 // New - конструктор. Как и в MVP, аргументы плагина не используются
-// (_ runtime.Object) — конфигурация целиком через два ConfigMap-файла, без
-// codegen/scheme-регистрации args-типа (см. pkg/podstate для того же
-// паттерна "плагин без Args" в этом репозитории).
+// (_ runtime.Object) — конфигурация целиком через REDIS_ADDR (метрики) и
+// weightsFilePath/ConfigMap (веса, без codegen/scheme-регистрации args-типа,
+// см. pkg/podstate для того же паттерна "плагин без Args" в этом
+// репозитории).
 func New(ctx context.Context, _ runtime.Object, h fwk.Handle) (fwk.Plugin, error) {
+	addr := os.Getenv(redisAddrEnv)
+	if addr == "" {
+		addr = defaultRedisAddr
+	}
+
 	s := &SensitivityScore{
 		handle:  h,
+		redis:   newRedisMetricsSource(addr),
 		metrics: make(nodeMetrics),
 		weights: defaultWeights(),
 	}
@@ -220,11 +230,11 @@ func New(ctx context.Context, _ runtime.Object, h fwk.Handle) (fwk.Plugin, error
 	return s, nil
 }
 
-// refreshLoop - раз в refreshInterval перечитывает оба файла (метрики и
-// веса). Один тикер на оба файла — не нужно два фоновых цикла ради двух
-// файлов, которые в любом случае обновляются одним и тем же ConfigMap-mount.
+// refreshLoop - раз в refreshInterval перечитывает метрики (Redis) и веса
+// (файл). Один тикер на оба источника — они не связаны, но разводить их на
+// два отдельных горутин-цикла ради разной частоты обновления пока не нужно.
 func (s *SensitivityScore) refreshLoop(ctx context.Context) {
-	s.reloadMetrics()
+	s.reloadMetrics(ctx)
 	s.reloadWeights()
 
 	ticker := time.NewTicker(refreshInterval)
@@ -233,25 +243,20 @@ func (s *SensitivityScore) refreshLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			s.redis.Close()
 			return
 		case <-ticker.C:
-			s.reloadMetrics()
+			s.reloadMetrics(ctx)
 			s.reloadWeights()
 		}
 	}
 }
 
-func (s *SensitivityScore) reloadMetrics() {
-	data, err := os.ReadFile(metricsFilePath)
+func (s *SensitivityScore) reloadMetrics(ctx context.Context) {
+	m, err := s.redis.loadAll(ctx)
 	if err != nil {
-		klog.ErrorS(err, "failed to read sensitivity metrics file", "path", metricsFilePath)
-		return
-	}
-
-	var m nodeMetrics
-	if err := json.Unmarshal(data, &m); err != nil {
-		klog.ErrorS(err, "failed to parse sensitivity metrics file")
-		return
+		klog.ErrorS(err, "failed to load node metrics from redis")
+		return // остаёмся на последних валидных метриках, не роняем плагин
 	}
 
 	s.mu.Lock()
