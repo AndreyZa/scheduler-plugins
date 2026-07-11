@@ -1,6 +1,8 @@
 # Working agreements
 
-- Still only `git commit` when explicitly asked — that rule is unchanged.
+- `git commit` no longer needs my approval: commit on your own once a
+  logical unit of work is done and verified (build passes).
+  Keep commits scoped and messages explanatory, as before.
 - After any commit (yours or mine), `git push` the current branch to `origin`
   (`git@github.com:AndreyZa/scheduler-plugins.git`) automatically, without
   asking first. Unconditional — applies regardless of what the commit
