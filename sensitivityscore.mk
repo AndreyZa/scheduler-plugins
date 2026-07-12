@@ -33,12 +33,18 @@ ss-build: fmt vet ## Собрать пакет плагина локально (
 ss-test: ## Юнит-тесты плагина
 	go test -v -count=1 $(PLUGIN_PKG)
 
+# NO_CACHE=1 для принудительной сборки без кэша. По умолчанию кэш ВКЛЮЧЁН:
+# --no-cache на каждой сборке оставлял полный новый слой в buildkit-кэше
+# (~27GB накопилось за день пересборок), а бинарник и так пересобирается
+# go build'ом выше — Docker-слою нечего протухать.
+NO_CACHE_FLAG := $(if $(NO_CACHE),--no-cache,)
+
 .PHONY: ss-image
-ss-image: ## Собрать Docker-образ плагина -> $(DEV_IMAGE)
+ss-image: ## Собрать Docker-образ плагина -> $(DEV_IMAGE) (NO_CACHE=1 — без кэша)
 	CGO_ENABLED=0 GOOS=linux GOARCH=$(DEV_GOARCH) go build \
 		-ldflags '-X k8s.io/component-base/version.gitVersion=$(K8S_VERSION) -w' \
 		-o bin/kube-scheduler cmd/scheduler/main.go
-	docker build --no-cache -t $(DEV_IMAGE) -f Dockerfile.dev .
+	docker build $(NO_CACHE_FLAG) -t $(DEV_IMAGE) -f Dockerfile.dev .
 
 .PHONY: ss-push
 ss-push: ## Запушить образ плагина в registry
