@@ -19,6 +19,7 @@ package resourcerequests
 import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/util/sets"
 	v1helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
 	v1qos "k8s.io/kubernetes/pkg/apis/core/v1/helper/qos"
 	"sigs.k8s.io/scheduler-plugins/pkg/util"
@@ -44,7 +45,7 @@ func IncludeNonNative(pod *corev1.Pod) bool {
 
 // AreExclusiveForPod checks if the given pod's containers are consuming exclusive resources
 // in the steady state of the pod, i.e. after the irrestartable init containers have finished running.
-func AreExclusiveForPod(pod *corev1.Pod) bool {
+func AreExclusiveForPod(pod *corev1.Pod, nrtResources sets.Set[corev1.ResourceName]) bool {
 	qos := v1qos.GetPodQOS(pod)
 
 	// filter out init containers with restart policy other than Always because these are *supposed* to
@@ -56,13 +57,13 @@ func AreExclusiveForPod(pod *corev1.Pod) bool {
 		}
 		restartableInitCnts = append(restartableInitCnts, ctr)
 	}
-	return areExclusiveForAnyContainer(qos, append(restartableInitCnts, pod.Spec.Containers...))
+	return areExclusiveForAnyContainer(qos, append(restartableInitCnts, pod.Spec.Containers...), nrtResources)
 }
 
-func areExclusiveForAnyContainer(qos corev1.PodQOSClass, containers []corev1.Container) bool {
+func areExclusiveForAnyContainer(qos corev1.PodQOSClass, containers []corev1.Container, nrtResources sets.Set[corev1.ResourceName]) bool {
 	for _, ctr := range containers {
 		for resource, quantity := range ctr.Resources.Requests {
-			if ok := IsExclusive(qos, resource, quantity); ok {
+			if ok := IsExclusive(qos, resource, quantity, nrtResources); ok {
 				return true
 			}
 		}
@@ -70,11 +71,13 @@ func areExclusiveForAnyContainer(qos corev1.PodQOSClass, containers []corev1.Con
 	return false
 }
 
-func IsExclusive(qos corev1.PodQOSClass, resource corev1.ResourceName, quantity resource.Quantity) bool {
-	// devices accessed via device plugins are non-shareable
-	// note until we reach better clarity we treat extended resources as devices
+func IsExclusive(qos corev1.PodQOSClass, resource corev1.ResourceName, quantity resource.Quantity, nrtResources sets.Set[corev1.ResourceName]) bool {
+	// Devices accessed via device plugins are non-shareable.
+	// However, devices which are accessed via device plugins but are not topology-bound,
+	// or extended resources which are not backed by a device plugin, should not be considered exclusive.
+	// our source of truth for this kind of distinctions is the NRT.
 	if !v1helper.IsNativeResource(resource) {
-		return true
+		return nrtResources.Has(resource)
 	}
 	if qos != corev1.PodQOSGuaranteed {
 		// nothing more we can check, bail out ASAP

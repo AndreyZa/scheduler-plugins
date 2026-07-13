@@ -23,17 +23,147 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/go-logr/logr/testr"
 	topologyv1alpha2 "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha2"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/sets"
 	podlisterv1 "k8s.io/client-go/listers/core/v1"
-	"k8s.io/klog/v2"
 	apiconfig "sigs.k8s.io/scheduler-plugins/apis/config"
 
 	"github.com/k8stopologyawareschedwg/podfingerprint"
 )
+
+func TestResourceNamesFromNRT(t *testing.T) {
+	tcases := []struct {
+		name     string
+		nrt      *topologyv1alpha2.NodeResourceTopology
+		expected sets.Set[corev1.ResourceName]
+	}{
+		{
+			name:     "nil",
+			nrt:      nil,
+			expected: nil,
+		},
+		{
+			name:     "no zones",
+			nrt:      &topologyv1alpha2.NodeResourceTopology{},
+			expected: sets.New[corev1.ResourceName](),
+		},
+		{
+			name: "single zone",
+			nrt: &topologyv1alpha2.NodeResourceTopology{
+				Zones: topologyv1alpha2.ZoneList{
+					{
+						Resources: topologyv1alpha2.ResourceInfoList{
+							MakeTopologyResInfo(cpu, "4", "4"),
+							MakeTopologyResInfo(memory, "8Gi", "8Gi"),
+						},
+					},
+				},
+			},
+			expected: sets.New(
+				corev1.ResourceCPU,
+				corev1.ResourceMemory,
+			),
+		},
+		{
+			name: "multiple zones deduplicates resource names",
+			nrt:  makeTestNRT("node-1"),
+			expected: sets.New(
+				corev1.ResourceCPU,
+				corev1.ResourceMemory,
+				corev1.ResourceName(nicResourceName),
+			),
+		},
+		{
+			name: "extended resource in zone",
+			nrt: &topologyv1alpha2.NodeResourceTopology{
+				Zones: topologyv1alpha2.ZoneList{
+					{
+						Resources: topologyv1alpha2.ResourceInfoList{
+							MakeTopologyResInfo("slow.io/accelerator", "1", "1"),
+						},
+					},
+				},
+			},
+			expected: sets.New(corev1.ResourceName("slow.io/accelerator")),
+		},
+	}
+
+	for _, tt := range tcases {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ResourceNamesFromNRT(tt.nrt)
+			if tt.expected == nil {
+				if got != nil {
+					t.Fatalf("expected nil set, got %v", got.UnsortedList())
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("expected %v, got nil", tt.expected.UnsortedList())
+			}
+			if !got.Equal(tt.expected) {
+				t.Fatalf("expected %v, got %v", tt.expected.UnsortedList(), got.UnsortedList())
+			}
+		})
+	}
+}
+
+func TestNrtResourcesStoreGetUpdateDelete(t *testing.T) {
+	nrts := []topologyv1alpha2.NodeResourceTopology{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "node-0"},
+			Zones: topologyv1alpha2.ZoneList{
+				{
+					Resources: topologyv1alpha2.ResourceInfoList{
+						MakeTopologyResInfo(cpu, "4", "4"),
+						MakeTopologyResInfo(nicResourceName, "2", "2"),
+					},
+				},
+			},
+		},
+	}
+
+	rs := newNrtResourcesStore(nrts)
+
+	got := rs.Get("node-0")
+	expected := sets.New(corev1.ResourceCPU, corev1.ResourceName(nicResourceName))
+	if !got.Equal(expected) {
+		t.Errorf("Get after init: got %v expected %v", got.UnsortedList(), expected.UnsortedList())
+	}
+
+	if got := rs.Get("node-missing"); got != nil {
+		t.Errorf("Get missing node: got %v expected nil", got.UnsortedList())
+	}
+
+	updatedNRT := &topologyv1alpha2.NodeResourceTopology{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-0"},
+		Zones: topologyv1alpha2.ZoneList{
+			{
+				Resources: topologyv1alpha2.ResourceInfoList{
+					MakeTopologyResInfo(cpu, "4", "4"),
+					MakeTopologyResInfo(nicResourceName, "2", "2"),
+					MakeTopologyResInfo("newdevice.io/gpu", "1", "1"),
+				},
+			},
+		},
+	}
+	rs.Update(updatedNRT)
+
+	got = rs.Get("node-0")
+	expected = sets.New(corev1.ResourceCPU, corev1.ResourceName(nicResourceName), corev1.ResourceName("newdevice.io/gpu"))
+	if !got.Equal(expected) {
+		t.Errorf("Get after Update: got %v expected %v", got.UnsortedList(), expected.UnsortedList())
+	}
+
+	rs.Delete("node-0")
+	if got := rs.Get("node-0"); got != nil {
+		t.Errorf("Get after Delete: got %v expected nil", got.UnsortedList())
+	}
+}
 
 func TestFingerprintFromNRT(t *testing.T) {
 	nrt := &topologyv1alpha2.NodeResourceTopology{
@@ -203,7 +333,7 @@ func TestNRTStoreGet(t *testing.T) {
 			},
 		},
 	}
-	ns := newNrtStore(klog.Background(), nrts)
+	ns := newNrtStore(testr.New(t), nrts)
 
 	obj := ns.GetNRTCopyByNodeName("node-0")
 	obj.TopologyPolicies[0] = "single-numa-node"
@@ -239,7 +369,7 @@ func TestNRTStoreUpdate(t *testing.T) {
 			},
 		},
 	}
-	ns := newNrtStore(klog.Background(), nrts)
+	ns := newNrtStore(testr.New(t), nrts)
 
 	nrt3 := &topologyv1alpha2.NodeResourceTopology{
 		ObjectMeta: metav1.ObjectMeta{
@@ -259,14 +389,14 @@ func TestNRTStoreUpdate(t *testing.T) {
 }
 
 func TestNRTStoreGetMissing(t *testing.T) {
-	ns := newNrtStore(klog.Background(), nil)
+	ns := newNrtStore(testr.New(t), nil)
 	if ns.GetNRTCopyByNodeName("node-missing") != nil {
 		t.Errorf("missing node returned non-nil data")
 	}
 }
 
 func TestNRTStoreContains(t *testing.T) {
-	ns := newNrtStore(klog.Background(), nil)
+	ns := newNrtStore(testr.New(t), nil)
 	if ns.Contains("node-0") {
 		t.Errorf("unexpected node found")
 	}
@@ -289,7 +419,7 @@ func TestNRTStoreContains(t *testing.T) {
 			},
 		},
 	}
-	ns = newNrtStore(klog.Background(), nrts)
+	ns = newNrtStore(testr.New(t), nrts)
 	if !ns.Contains("node-0") {
 		t.Errorf("missing node")
 	}
@@ -410,7 +540,7 @@ func TestResourceStoreAddPod(t *testing.T) {
 		},
 	}
 
-	rs := newResourceStore(klog.Background())
+	rs := newResourceStore(testr.New(t))
 	existed := rs.AddPod(&pod)
 	if existed {
 		t.Fatalf("replaced a pod into a empty resourceStore")
@@ -442,7 +572,7 @@ func TestResourceStoreDeletePod(t *testing.T) {
 		},
 	}
 
-	rs := newResourceStore(klog.Background())
+	rs := newResourceStore(testr.New(t))
 	existed := rs.DeletePod(&pod)
 	if existed {
 		t.Fatalf("deleted a pod into a empty resourceStore")
@@ -509,7 +639,7 @@ func TestResourceStoreUpdate(t *testing.T) {
 		},
 	}
 
-	rs := newResourceStore(klog.Background())
+	rs := newResourceStore(testr.New(t))
 	existed := rs.AddPod(&pod)
 	if existed {
 		t.Fatalf("replacing a pod into a empty resourceStore")
@@ -582,7 +712,7 @@ func TestCheckPodFingerprintForNode(t *testing.T) {
 
 	for _, tcase := range tcases {
 		t.Run(tcase.description, func(t *testing.T) {
-			gotErr := checkPodFingerprintForNode(klog.Background(), tcase.objs, "test-node", tcase.pfp, tcase.onlyExclRes)
+			gotErr := checkPodFingerprintForNode(testr.New(t), tcase.objs, "test-node", tcase.pfp, tcase.onlyExclRes)
 			if !errors.Is(gotErr, tcase.expectedErr) {
 				t.Errorf("got error %v expected %v", gotErr, tcase.expectedErr)
 			}

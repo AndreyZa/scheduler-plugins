@@ -47,6 +47,7 @@ type OverReserve struct {
 	lock             sync.Mutex
 	generation       uint64
 	nrts             *nrtStore
+	nrtResNames      *nrtResourcesStore
 	assumedResources map[string]*resourceStore // nodeName -> resourceStore
 	// nodesMaybeOverreserved counts how many times a node is filtered out. This is used as trigger condition to try
 	// to resync nodes. See The documentation of Resync() below for more details.
@@ -77,6 +78,7 @@ func NewOverReserve(ctx context.Context, lh logr.Logger, cfg *apiconfig.NodeReso
 		lh:                     lh,
 		client:                 client,
 		nrts:                   newNrtStore(lh, nrtObjs.Items),
+		nrtResNames:            newNrtResourcesStore(nrtObjs.Items),
 		assumedResources:       make(map[string]*resourceStore),
 		nodesMaybeOverreserved: newCounter(),
 		nodesWithForeignPods:   newCounter(),
@@ -277,7 +279,7 @@ func (ov *OverReserve) MakeNRTUpdatesForNodes(ctx context.Context, lh_ logr.Logg
 	var nrtUpdates []*topologyv1alpha2.NodeResourceTopology
 
 	// node -> pod identifier (namespace, name)
-	nodeToObjsMap, err := makeNodeToPodDataMap(lh_, ov.podLister, ov.isPodRelevant)
+	nodeToObjsMap, err := makeNodeToPodDataMap(lh_, ov.podLister, ov.isPodRelevant, ov.nrtResNames.Get)
 	if err != nil {
 		lh_.Error(err, "cannot find the mapping between running pods and nodes")
 		return nrtUpdates
@@ -355,6 +357,7 @@ func (ov *OverReserve) FlushNodes(lh logr.Logger, nrts ...*topologyv1alpha2.Node
 	for _, nrt := range nrts {
 		lh.V(2).Info("flushing", logging.KeyNode, nrt.Name)
 		ov.nrts.Update(nrt)
+		ov.nrtResNames.Update(nrt)
 		delete(ov.assumedResources, nrt.Name)
 		ov.nodesMaybeOverreserved.Delete(nrt.Name)
 		ov.nodesWithForeignPods.Delete(nrt.Name)
@@ -379,7 +382,7 @@ func (ov *OverReserve) TestOnlyUpdateNRT(nrt *topologyv1alpha2.NodeResourceTopol
 	ov.nrts.Update(nrt)
 }
 
-func makeNodeToPodDataMap(lh logr.Logger, podLister podlisterv1.PodLister, isPodRelevant podprovider.PodFilterFunc) (map[string][]podData, error) {
+func makeNodeToPodDataMap(lh logr.Logger, podLister podlisterv1.PodLister, isPodRelevant podprovider.PodFilterFunc, nrtResourcesLookup NRTResourcesLookupFunc) (map[string][]podData, error) {
 	nodeToObjsMap := make(map[string][]podData)
 	pods, err := podLister.List(labels.Everything())
 	if err != nil {
@@ -389,11 +392,12 @@ func makeNodeToPodDataMap(lh logr.Logger, podLister podlisterv1.PodLister, isPod
 		if !isPodRelevant(lh, pod) {
 			continue
 		}
+		nrtResources := nrtResourcesLookup(pod.Spec.NodeName)
 		nodeObjs := nodeToObjsMap[pod.Spec.NodeName]
 		nodeObjs = append(nodeObjs, podData{
 			Namespace:             pod.Namespace,
 			Name:                  pod.Name,
-			HasExclusiveResources: resourcerequests.AreExclusiveForPod(pod),
+			HasExclusiveResources: resourcerequests.AreExclusiveForPod(pod, nrtResources),
 		})
 		nodeToObjsMap[pod.Spec.NodeName] = nodeObjs
 	}

@@ -18,9 +18,11 @@ package cache
 
 import (
 	"strings"
+	"sync"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/go-logr/logr"
 	topologyv1alpha2 "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha2"
@@ -67,6 +69,58 @@ func (nrs *nrtStore) GetNRTCopyByNodeName(nodeName string) *topologyv1alpha2.Nod
 		return nil
 	}
 	return obj.DeepCopy()
+}
+
+// ResourceNamesFromNRT returns the set of resource names listed in the given NRT zones.
+func ResourceNamesFromNRT(nrt *topologyv1alpha2.NodeResourceTopology) sets.Set[corev1.ResourceName] {
+	if nrt == nil {
+		return nil
+	}
+	res := sets.New[corev1.ResourceName]()
+	for _, zone := range nrt.Zones {
+		for _, resInfo := range zone.Resources {
+			res.Insert(corev1.ResourceName(resInfo.Name))
+		}
+	}
+	return res
+}
+
+// NRTResourcesLookupFunc returns the set of resource names for the given node.
+type NRTResourcesLookupFunc func(nodeName string) sets.Set[corev1.ResourceName]
+
+// nrtResourcesStore is a lightweight, thread-safe per-node cache of resource names
+// extracted from NRT zones. It is decoupled from the main nrtStore/OverReserve lock
+// so that foreign-pod detection can look up resource names without contending with
+// the scheduling hot path.
+type nrtResourcesStore struct {
+	mu   sync.RWMutex
+	data map[string]sets.Set[corev1.ResourceName]
+}
+
+func newNrtResourcesStore(nrts []topologyv1alpha2.NodeResourceTopology) *nrtResourcesStore {
+	data := make(map[string]sets.Set[corev1.ResourceName], len(nrts))
+	for _, nrt := range nrts {
+		data[nrt.Name] = ResourceNamesFromNRT(&nrt)
+	}
+	return &nrtResourcesStore{data: data}
+}
+
+func (rs *nrtResourcesStore) Get(nodeName string) sets.Set[corev1.ResourceName] {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	return rs.data[nodeName]
+}
+
+func (rs *nrtResourcesStore) Update(nrt *topologyv1alpha2.NodeResourceTopology) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	rs.data[nrt.Name] = ResourceNamesFromNRT(nrt)
+}
+
+func (rs *nrtResourcesStore) Delete(nodeName string) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	delete(rs.data, nodeName)
 }
 
 // Update adds or replace the Node Resource Topology associated to a node. Always do a copy.
