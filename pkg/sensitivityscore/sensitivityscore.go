@@ -87,10 +87,8 @@ type nodePressure struct {
 // refreshLoop.
 type nodeMetrics map[string]nodePressure
 
-// weights - вес каждого измерения в скор-функции, [0, +inf). Хранится
-// отдельным файлом именно для того, чтобы абляционные прогоны (Глава 3:
-// "что если убрать NUMA из score") делались правкой ConfigMap, а не кода.
-// Пример файла: {"llc": 1.0, "numa": 1.0, "net": 1.0, "io": 1.0}
+// weights - вес каждого измерения, [0, +inf); четвёрка осей, используется
+// и для базовой, и для чувствительностной части scoreWeights.
 type weights struct {
 	LLC  float64 `json:"llc"`
 	NUMA float64 `json:"numa"`
@@ -98,8 +96,53 @@ type weights struct {
 	IO   float64 `json:"io"`
 }
 
-func defaultWeights() weights {
-	return weights{LLC: 1.0, NUMA: 1.0, Net: 1.0, IO: 1.0}
+// scoreWeights - цена осей в скор-функции, двумя слагаемыми на ось:
+//
+//	вклад оси = (base + sensitivity * s_job) * pressure
+//
+// base — базовая цена: платит ЛЮБАЯ задача на узле независимо от её
+// декларации (эмпирика STAGE: iowait дискового шторма замедляет все задачи
+// узла на ~единицу давления * base, даже с sensitivity-io: low);
+// sensitivity — надбавка чувствительной задачи (прежняя, единственная до
+// калибровки, часть скоринга). Хранится отдельным файлом (ConfigMap),
+// чтобы абляции и калибровка стенда были правкой конфига, а не кода.
+//
+// Формат файла: {"base": {"llc": 0, ...}, "sensitivity": {"llc": 1, ...}};
+// легаси-формат {"llc": 1.0, ...} читается как sensitivity с base=0 —
+// поведение до этого изменения.
+type scoreWeights struct {
+	Base weights `json:"base"`
+	Sens weights `json:"sensitivity"`
+}
+
+func defaultWeights() scoreWeights {
+	return scoreWeights{Sens: weights{LLC: 1.0, NUMA: 1.0, Net: 1.0, IO: 1.0}}
+}
+
+// parseWeights разбирает weights.json в обоих форматах (см. scoreWeights).
+func parseWeights(data []byte) (scoreWeights, error) {
+	var probe struct {
+		Base *weights `json:"base"`
+		Sens *weights `json:"sensitivity"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return scoreWeights{}, err
+	}
+	if probe.Base != nil || probe.Sens != nil {
+		out := scoreWeights{}
+		if probe.Base != nil {
+			out.Base = *probe.Base
+		}
+		if probe.Sens != nil {
+			out.Sens = *probe.Sens
+		}
+		return out, nil
+	}
+	var flat weights
+	if err := json.Unmarshal(data, &flat); err != nil {
+		return scoreWeights{}, err
+	}
+	return scoreWeights{Sens: flat}, nil
 }
 
 // SensitivityScore - плагин с in-memory кэшем метрик и весов; метрики берутся
@@ -111,7 +154,7 @@ type SensitivityScore struct {
 
 	mu      sync.RWMutex
 	metrics nodeMetrics
-	weights weights
+	weights scoreWeights
 }
 
 var _ fwk.ScorePlugin = &SensitivityScore{}
@@ -151,23 +194,36 @@ func (s *SensitivityScore) Score(
 		return neutral, nil
 	}
 
-	// Взвешенное скалярное произведение профиля job и давления ноды —
-	// чем выше произведение, тем больше риск интерференции. Net участвует
-	// наравне с остальными осями: метрика теперь нормализована честно
-	// (net_pressure = net_bw / NET_REFERENCE_MBPS калибровки стенда, см.
-	// redis_source.go); на неоткалиброванном стенде ось выключается весом
-	// {"net": 0} в weights.json — тогда она не входит ни в сумму, ни в
-	// знаменатель, и вклад остальных осей не разбавляется.
-	interference := jobProfile.LLC*pressure.LLC*w.LLC +
-		jobProfile.NUMA*pressure.NUMA*w.NUMA +
-		jobProfile.Net*pressure.Net*w.Net +
-		jobProfile.IO*pressure.IO*w.IO
+	score := interferenceScore(jobProfile, pressure, w)
 
-	// Знаменатель — теоретический максимум при всех УЧАСТВУЮЩИХ измерениях
-	// = 1.0 (сумма их весов * 100, т.к. pressure в шкале 0-100). Даёт
-	// нормировку в [0, 100] независимо от того, сколько измерений реально
-	// "горячие".
-	maxPossible := (w.LLC + w.NUMA + w.Net + w.IO) * 100
+	klog.InfoS("SensitivityScore.Score called",
+		"pod", pod.Name, "node", nodeName,
+		"jobProfile", jobProfile, "pressure", pressure, "score", score)
+
+	return score, nil
+}
+
+// interferenceScore - чистая скор-функция (без кэшей и логов, тестируема
+// отдельно): 100 − нормированная интерференция, где вклад каждой оси =
+// (base + sensitivity*s_job) * pressure. Net участвует наравне с остальными
+// осями (net_pressure нормализован калибровкой NET_REFERENCE_MBPS, см.
+// redis_source.go); неоткалиброванная/ненужная ось выключается нулями в
+// ОБЕИХ частях весов — тогда она не входит ни в сумму, ни в знаменатель,
+// и вклад остальных осей не разбавляется.
+func interferenceScore(s sensitivityVector, p nodePressure, w scoreWeights) int64 {
+	axis := func(base, sens, sv, pv float64) float64 {
+		return (base + sens*sv) * pv
+	}
+	interference := axis(w.Base.LLC, w.Sens.LLC, s.LLC, p.LLC) +
+		axis(w.Base.NUMA, w.Sens.NUMA, s.NUMA, p.NUMA) +
+		axis(w.Base.Net, w.Sens.Net, s.Net, p.Net) +
+		axis(w.Base.IO, w.Sens.IO, s.IO, p.IO)
+
+	// Знаменатель — теоретический максимум: все участвующие оси горячие
+	// (pressure=100) у полностью чувствительной задачи (s=1, т.е. base+sens
+	// целиком). Нормирует в [0, 100] при любом наборе включённых осей.
+	maxPossible := (w.Base.LLC + w.Sens.LLC + w.Base.NUMA + w.Sens.NUMA +
+		w.Base.Net + w.Sens.Net + w.Base.IO + w.Sens.IO) * 100
 	var normalized float64
 	if maxPossible > 0 {
 		normalized = interference / maxPossible // в [0,1] при разумных весах
@@ -180,12 +236,7 @@ func (s *SensitivityScore) Score(
 	if score > fwk.MaxNodeScore {
 		score = fwk.MaxNodeScore
 	}
-
-	klog.InfoS("SensitivityScore.Score called",
-		"pod", pod.Name, "node", nodeName,
-		"jobProfile", jobProfile, "pressure", pressure, "score", score)
-
-	return score, nil
+	return score
 }
 
 func (s *SensitivityScore) ScoreExtensions() fwk.ScoreExtensions {
@@ -294,13 +345,20 @@ func (s *SensitivityScore) reloadWeights() {
 		return // нет файла весов — остаёмся на дефолтных/предыдущих валидных
 	}
 
-	var w weights
-	if err := json.Unmarshal(data, &w); err != nil {
+	w, err := parseWeights(data)
+	if err != nil {
 		klog.ErrorS(err, "failed to parse sensitivity weights file")
 		return
 	}
 
 	s.mu.Lock()
+	changed := w != s.weights
 	s.weights = w
 	s.mu.Unlock()
+	if changed {
+		// Лог только на смену (файл перечитывается каждые refreshInterval) —
+		// по нему на живом кластере видно, что калибровка доехала.
+		klog.InfoS("sensitivity weights loaded",
+			"base", w.Base, "sensitivity", w.Sens)
+	}
 }
