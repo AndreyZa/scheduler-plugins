@@ -1,0 +1,111 @@
+# CI плагина SensitivityScore. Апстримные workflow форка не трогаем — этот
+# файл живёт рядом с ними и касается только нашего кода.
+#
+# Схема тегов — неподвижный на релиз (выбрана 02.08.2026): каждый пуш в
+# master, задевающий код плагина, публикует andreyza/sensitivityscore:
+# v<дата>-<коммит> и БОЛЬШЕ ЕГО НЕ ДВИГАЕТ. Подвижного :dev у планировщика
+# нет намеренно: он предмет измерения, и с imagePullPolicy: Always стенд на
+# подвижном теге молча получал бы новый планировщик при любом рестарте пода —
+# посреди серии, между повторами. Бенч остаётся на пине SCHEDULER_RELEASE_VER
+# в своём Makefile и переезжает на новый тег осознанно, перед серией.
+name: sensitivityscore
+
+on:
+  push:
+    branches: [master]
+    # Входы бинаря планировщика: сам плагин, его сборочная обвязка и main
+    # (плагин регистрируется в cmd/scheduler через main.go.patch). Правки
+    # апстримных плагинов, доков и хелма релиз не порождают.
+    paths:
+      - "pkg/sensitivityscore/**"
+      - "sensitivityscore.mk"
+      - "Dockerfile.dev"
+      - "main.go.patch"
+      - "cmd/scheduler/**"
+      - ".github/workflows/sensitivityscore.yml"
+  pull_request:
+    paths:
+      - "pkg/sensitivityscore/**"
+      - "sensitivityscore.mk"
+      - "Dockerfile.dev"
+      - "main.go.patch"
+      - "cmd/scheduler/**"
+      - ".github/workflows/sensitivityscore.yml"
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: тесты плагина
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: go vet (только плагин)
+        run: go vet ./pkg/sensitivityscore/...
+
+      - name: Юнит-тесты плагина
+        run: go test ./pkg/sensitivityscore/...
+
+  release:
+    name: релиз образа
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Проверить секреты registry
+        env:
+          U: ${{ secrets.DOCKERHUB_USERNAME }}
+          T: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "$U" ] || [ -z "$T" ]; then
+            echo "::error::нет секретов DOCKERHUB_USERNAME / DOCKERHUB_TOKEN — Settings → Secrets and variables → Actions ЭТОГО репозитория (в бенче и ss-notifier они уже есть, форку нужны свои)"
+            exit 1
+          fi
+
+      - name: Логин в Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Тег считается ЗДЕСЬ по той же формуле, что RELEASE_VERSION в
+      # sensitivityscore.mk, и передаётся сборке явно. Не из вредности: дата
+      # внутри make вычисляется в момент сборки, и релиз, стартовавший до
+      # полуночи, печатал бы в сводку не тот тег, что запушил. Один расчёт —
+      # один тег в обоих местах.
+      - name: Тег релиза
+        id: tag
+        run: echo "tag=v$(date +%Y%m%d)-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Той же целью, что и руками: sensitivityscore.mk собирает бинарь
+      # (go build с gitVersion в ldflags) и docker-образ. CI ничего не
+      # дублирует — иначе локальная сборка и CI рано или поздно разошлись бы.
+      - name: Сборка и пуш (ss-release)
+        run: make -f sensitivityscore.mk ss-release RELEASE_VERSION=${{ steps.tag.outputs.tag }}
+
+      # Тег в сводку прогона: он и есть результат релиза, и его предстоит
+      # руками вписать в SCHEDULER_RELEASE_VER бенча при переезде.
+      - name: Тег в сводку
+        run: |
+          {
+            echo "## Выпущен образ плагина"
+            echo
+            echo '```'
+            echo "andreyza/sensitivityscore:${{ steps.tag.outputs.tag }}"
+            echo '```'
+            echo
+            echo "Чтобы стенд перешёл на него: в бенче SCHEDULER_RELEASE_VER := ${{ steps.tag.outputs.tag }},"
+            echo "затем make scheduler-deploy (rollout restart вшит)."
+          } >> "$GITHUB_STEP_SUMMARY"
