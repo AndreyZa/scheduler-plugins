@@ -54,7 +54,11 @@ jobs:
   release:
     name: релиз образа
     needs: test
-    if: github.event_name == 'push'
+    # Релизит и пуш в master, и РУЧНОЙ запуск: первый вариант условия
+    # (== 'push') оставлял workflow_dispatch без релизного джоба вовсе — то
+    # есть перезапустить релиз после починки секретов было нечем, кроме
+    # пустого коммита. Не релизит только pull_request.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
