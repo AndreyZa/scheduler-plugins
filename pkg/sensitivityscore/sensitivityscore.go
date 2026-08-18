@@ -65,7 +65,9 @@ const defaultRedisAddr = "redis.sensitivityscore-system.svc.cluster.local:6379"
 // weightsFilePath - путь к файлу с весами измерений S, тоже монтируется через
 // ConfigMap, тоже перечитывается тем же тикером. Отдельный файл, а не часть
 // node-metrics.json, чтобы менять веса (абляция) не задевая пайплайн метрик.
-const weightsFilePath = "/etc/sensitivity/weights.json"
+// var, а не const, только ради тестов reloadWeights (подменяют путь на
+// временный файл); в рантайме не переопределяется.
+var weightsFilePath = "/etc/sensitivity/weights.json"
 
 // refreshInterval - как часто перечитывать оба файла.
 const refreshInterval = 10 * time.Second
@@ -155,6 +157,9 @@ type SensitivityScore struct {
 	mu      sync.RWMutex
 	metrics nodeMetrics
 	weights scoreWeights
+	// Первая успешная загрузка весов логируется всегда, даже если веса
+	// совпали с дефолтными (см. reloadWeights).
+	weightsLogged bool
 }
 
 var _ fwk.ScorePlugin = &SensitivityScore{}
@@ -352,12 +357,19 @@ func (s *SensitivityScore) reloadWeights() {
 	}
 
 	s.mu.Lock()
+	// Первая успешная загрузка логируется ВСЕГДА, дальше — только на смену
+	// (файл перечитывается каждые refreshInterval). Раньше условием была одна
+	// лишь смена, и веса, совпавшие с defaultWeights() (а это ровно легаси-
+	// формат {"llc":1,"numa":1,"net":1,"io":1}), не печатали ничего никогда:
+	// preflight серии ждёт эту строку и падал с «образ без parseWeights?» на
+	// исправном планировщике (scripts/run-series.sh в соседнем репозитории).
+	first := !s.weightsLogged
 	changed := w != s.weights
 	s.weights = w
+	s.weightsLogged = true
 	s.mu.Unlock()
-	if changed {
-		// Лог только на смену (файл перечитывается каждые refreshInterval) —
-		// по нему на живом кластере видно, что калибровка доехала.
+	if first || changed {
+		// По этой строке на живом кластере видно, что калибровка доехала.
 		klog.InfoS("sensitivity weights loaded",
 			"base", w.Base, "sensitivity", w.Sens)
 	}

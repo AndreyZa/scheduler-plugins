@@ -1,6 +1,14 @@
 package sensitivityscore
 
-import "testing"
+import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"k8s.io/klog/v2"
+)
 
 func TestParseWeightsLegacyFlat(t *testing.T) {
 	w, err := parseWeights([]byte(`{"llc": 1.0, "numa": 0.0, "net": 1.0, "io": 1.0}`))
@@ -85,5 +93,55 @@ func TestInterferenceScoreZeroWeights(t *testing.T) {
 		sensitivityVector{LLC: 1}, nodePressure{LLC: 100}, scoreWeights{})
 	if got != 100 {
 		t.Errorf("zero weights: got %d, want 100", got)
+	}
+}
+
+// Регресс на баг, найденный сверкой лабы с прод-IaC 18.08.2026: строка
+// "sensitivity weights loaded" логировалась ТОЛЬКО при смене весов, поэтому
+// веса, совпавшие с defaultWeights() (легаси-формат {"llc":1,...}), не
+// печатали её никогда — а preflight серии (scripts/run-series.sh в bench-репо)
+// ждёт её и валил прогон на исправном планировщике.
+func TestReloadWeightsLogsFirstLoadEvenWhenEqualToDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "weights.json")
+	// Ровно defaultWeights(): легаси-формат, все веса чувствительности = 1.
+	if err := os.WriteFile(path, []byte(`{"llc":1.0,"numa":1.0,"net":1.0,"io":1.0}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	orig := weightsFilePath
+	weightsFilePath = path
+	defer func() { weightsFilePath = orig }()
+
+	var buf bytes.Buffer
+	klog.SetOutput(&buf)
+	klog.LogToStderr(false)
+	defer func() { klog.LogToStderr(true) }()
+
+	s := &SensitivityScore{weights: defaultWeights()}
+
+	s.reloadWeights()
+	klog.Flush()
+	if got := strings.Count(buf.String(), "sensitivity weights loaded"); got != 1 {
+		t.Fatalf("первая загрузка обязана логироваться ровно один раз, получено %d; лог: %s", got, buf.String())
+	}
+	if !s.weightsLogged {
+		t.Error("после первой загрузки weightsLogged должен быть true")
+	}
+
+	// Повторное чтение того же файла ничего не меняет — второй строки быть не должно.
+	s.reloadWeights()
+	klog.Flush()
+	if got := strings.Count(buf.String(), "sensitivity weights loaded"); got != 1 {
+		t.Fatalf("неизменные веса не должны логироваться повторно, получено %d", got)
+	}
+
+	// А вот смена весов обязана дать вторую строку.
+	if err := os.WriteFile(path, []byte(`{"base":{"io":0.23},"sensitivity":{"io":0.63}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.reloadWeights()
+	klog.Flush()
+	if got := strings.Count(buf.String(), "sensitivity weights loaded"); got != 2 {
+		t.Fatalf("смена весов обязана логироваться, получено %d", got)
 	}
 }
