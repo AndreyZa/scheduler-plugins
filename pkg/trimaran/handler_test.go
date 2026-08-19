@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	clientcache "k8s.io/client-go/tools/cache"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 )
 
@@ -74,4 +75,42 @@ func TestHandlerCacheCleanup(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Регресс на панику, снятую с прод-стенда 19.08.2026: информер отдаёт в
+// OnDelete надгробие DeletedFinalStateUnknown, когда пропустил событие
+// удаления (релист после разрыва watch — на проде это происходило при каждом
+// перезапуске apiserver'а). Голое приведение типа паниковало, а паника в
+// обработчике информера роняет ВЕСЬ процесс планировщика: вместе с Trimaran
+// умирал и профиль sensitivityscore, к которому этот код отношения не имеет.
+func TestOnDeleteHandlesTombstone(t *testing.T) {
+	nodeName := "node-1"
+	pod := st.MakePod().Name("Pod-1").Node(nodeName).Obj()
+
+	newHandler := func() *PodAssignEventHandler {
+		h := New()
+		h.ScheduledPodsCache[nodeName] = []podInfo{{Timestamp: time.Now(), Pod: pod}}
+		return h
+	}
+
+	t.Run("надгробие с подом внутри удаляет запись из кэша", func(t *testing.T) {
+		h := newHandler()
+		h.OnDelete(clientcache.DeletedFinalStateUnknown{Key: nodeName + "/Pod-1", Obj: pod})
+		assert.Empty(t, h.ScheduledPodsCache[nodeName],
+			"под из надгробия обязан быть вычищен, иначе кэш Trimaran течёт")
+	})
+
+	t.Run("надгробие с посторонним объектом не роняет процесс", func(t *testing.T) {
+		h := newHandler()
+		assert.NotPanics(t, func() {
+			h.OnDelete(clientcache.DeletedFinalStateUnknown{Key: "мусор", Obj: "не под"})
+		})
+		assert.Len(t, h.ScheduledPodsCache[nodeName], 1, "чужой объект не должен трогать кэш")
+	})
+
+	t.Run("совсем посторонний тип не роняет процесс", func(t *testing.T) {
+		h := newHandler()
+		assert.NotPanics(t, func() { h.OnDelete("вообще не объект") })
+		assert.Len(t, h.ScheduledPodsCache[nodeName], 1)
+	})
 }

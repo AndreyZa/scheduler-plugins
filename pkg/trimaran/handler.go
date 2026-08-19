@@ -109,7 +109,28 @@ func (p *PodAssignEventHandler) OnUpdate(oldObj, newObj interface{}) {
 
 func (p *PodAssignEventHandler) OnDelete(obj interface{}) {
 	logger := klog.FromContext(context.TODO())
-	pod := obj.(*v1.Pod)
+	// Информер отдаёт сюда не только *v1.Pod: если он пропустил событие
+	// удаления (релист после разрыва watch — например, при перезапуске
+	// apiserver'а), приходит надгробие cache.DeletedFinalStateUnknown с
+	// последним известным состоянием объекта. Голое приведение типа на нём
+	// паниковало, а паника в обработчике информера роняет ВЕСЬ процесс
+	// планировщика — вместе с профилем sensitivityscore, хотя к Trimaran он
+	// отношения не имеет. На проде это давало ~10 падений за 15 часов
+	// (19.08.2026): каждая массовая уборка подов после серии — риск остаться
+	// без планировщика посреди следующей.
+	pod, ok := obj.(*v1.Pod)
+	if !ok {
+		tombstone, ok := obj.(clientcache.DeletedFinalStateUnknown)
+		if !ok {
+			logger.V(4).Info("OnDelete: неожиданный тип объекта, пропускаю", "obj", fmt.Sprintf("%T", obj))
+			return
+		}
+		pod, ok = tombstone.Obj.(*v1.Pod)
+		if !ok {
+			logger.V(4).Info("OnDelete: в надгробии не под, пропускаю", "obj", fmt.Sprintf("%T", tombstone.Obj))
+			return
+		}
+	}
 	nodeName := pod.Spec.NodeName
 	p.Lock()
 	defer p.Unlock()
