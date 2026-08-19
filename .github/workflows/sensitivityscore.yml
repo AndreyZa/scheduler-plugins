@@ -14,10 +14,19 @@ on:
   push:
     branches: [master]
     # Входы бинаря планировщика: сам плагин, его сборочная обвязка и main
-    # (плагин регистрируется в cmd/scheduler через main.go.patch). Правки
-    # апстримных плагинов, доков и хелма релиз не порождают.
+    # (плагин регистрируется в cmd/scheduler через main.go.patch), а также
+    # pkg/trimaran — апстримные плагины, которые стенд РЕАЛЬНО включает
+    # (LoadVariationRiskBalancing, Peaks, TargetLoadPacking) и которые живут
+    # в ОДНОМ процессе с нашим профилем.
+    #
+    # Про trimaran пришлось добавить отдельно (19.08.2026): фикс паники в
+    # pkg/trimaran/handler.go не породил релиза, хотя именно эта паника роняла
+    # весь планировщик на проде вместе с профилем sensitivityscore. «Правка
+    # апстрима не наша забота» верно только для кода, которого нет в бинаре.
+    # Доки и хелм релиз по-прежнему не порождают.
     paths:
       - "pkg/sensitivityscore/**"
+      - "pkg/trimaran/**"
       - "sensitivityscore.mk"
       - "Dockerfile.dev"
       - "main.go.patch"
@@ -26,6 +35,7 @@ on:
   pull_request:
     paths:
       - "pkg/sensitivityscore/**"
+      - "pkg/trimaran/**"
       - "sensitivityscore.mk"
       - "Dockerfile.dev"
       - "main.go.patch"
