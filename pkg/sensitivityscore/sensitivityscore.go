@@ -32,6 +32,7 @@ package sensitivityscore
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"sync"
 	"time"
@@ -43,6 +44,17 @@ import (
 )
 
 const Name = "SensitivityScore"
+const NoSensitivityName = "SensitivityScoreNoSensitivity"
+const NoBaseName = "SensitivityScoreNoBase"
+const MaxPressureName = "CalibratedMaxPressure"
+
+const (
+	variantNoSensitivity = "ss-no-sensitivity"
+	variantNoBase        = "ss-no-base"
+	variantMaxPressure   = "max-pressure"
+	aggregationSum       = "sum"
+	aggregationMax       = "max"
+)
 
 // Annotation keys a job uses to declare its own sensitivity profile S_job.
 // Values are "high" | "medium" | "low" (mapped to 1.0 / 0.5 / 0.0), matching
@@ -113,12 +125,30 @@ type weights struct {
 // легаси-формат {"llc": 1.0, ...} читается как sensitivity с base=0 —
 // поведение до этого изменения.
 type scoreWeights struct {
-	Base weights `json:"base"`
-	Sens weights `json:"sensitivity"`
+	Base        weights `json:"base"`
+	Sens        weights `json:"sensitivity"`
+	Aggregation string  `json:"aggregation"`
 }
 
 func defaultWeights() scoreWeights {
-	return scoreWeights{Sens: weights{LLC: 1.0, NUMA: 1.0, Net: 1.0, IO: 1.0}}
+	return scoreWeights{
+		Sens:        weights{LLC: 1.0, NUMA: 1.0, Net: 1.0, IO: 1.0},
+		Aggregation: aggregationSum,
+	}
+}
+
+func defaultWeightsForVariant(variant string) scoreWeights {
+	w := defaultWeights()
+	switch variant {
+	case variantNoSensitivity, variantMaxPressure:
+		w.Base, w.Sens = w.Sens, weights{}
+	case variantNoBase:
+		w.Base = weights{}
+	}
+	if variant == variantMaxPressure {
+		w.Aggregation = aggregationMax
+	}
+	return w
 }
 
 // parseWeights разбирает weights.json в обоих форматах (см. scoreWeights).
@@ -131,7 +161,7 @@ func parseWeights(data []byte) (scoreWeights, error) {
 		return scoreWeights{}, err
 	}
 	if probe.Base != nil || probe.Sens != nil {
-		out := scoreWeights{}
+		out := scoreWeights{Aggregation: aggregationSum}
 		if probe.Base != nil {
 			out.Base = *probe.Base
 		}
@@ -144,15 +174,51 @@ func parseWeights(data []byte) (scoreWeights, error) {
 	if err := json.Unmarshal(data, &flat); err != nil {
 		return scoreWeights{}, err
 	}
-	return scoreWeights{Sens: flat}, nil
+	return scoreWeights{Sens: flat, Aggregation: aggregationSum}, nil
+}
+
+// parseWeightDocument добавляет необязательные named variants к существующему
+// формату. Корневые base/sensitivity по-прежнему описывают основной плагин;
+// каждый variant имеет собственные веса и агрегацию sum|max.
+func parseWeightDocument(data []byte) (scoreWeights, map[string]scoreWeights, error) {
+	root, err := parseWeights(data)
+	if err != nil {
+		return scoreWeights{}, nil, err
+	}
+	var doc struct {
+		Variants map[string]scoreWeights `json:"variants"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return scoreWeights{}, nil, err
+	}
+	for name, w := range doc.Variants {
+		if w.Aggregation == "" {
+			w.Aggregation = aggregationSum
+		}
+		if w.Aggregation != aggregationSum && w.Aggregation != aggregationMax {
+			return scoreWeights{}, nil, fmt.Errorf("variant %s: unsupported aggregation %q", name, w.Aggregation)
+		}
+		baseSum := w.Base.LLC + w.Base.NUMA + w.Base.Net + w.Base.IO
+		sensSum := w.Sens.LLC + w.Sens.NUMA + w.Sens.Net + w.Sens.IO
+		if baseSum+sensSum == 0 {
+			return scoreWeights{}, nil, fmt.Errorf("variant %s: all weights are zero", name)
+		}
+		if w.Aggregation == aggregationMax && baseSum == 0 {
+			return scoreWeights{}, nil, fmt.Errorf("variant %s: max aggregation requires non-zero base weights", name)
+		}
+		doc.Variants[name] = w
+	}
+	return root, doc.Variants, nil
 }
 
 // SensitivityScore - плагин с in-memory кэшем метрик и весов; метрики берутся
 // из Redis, веса — из файла, оба обновляются периодическим тикером (Score()
 // сам никогда не делает сетевых вызовов — читает только кэш).
 type SensitivityScore struct {
-	handle fwk.Handle
-	redis  *redisMetricsSource
+	handle     fwk.Handle
+	redis      *redisMetricsSource
+	name       string
+	variantKey string
 
 	mu      sync.RWMutex
 	metrics nodeMetrics
@@ -165,7 +231,10 @@ type SensitivityScore struct {
 var _ fwk.ScorePlugin = &SensitivityScore{}
 
 func (s *SensitivityScore) Name() string {
-	return Name
+	if s.name == "" {
+		return Name
+	}
+	return s.name
 }
 
 // Score - формализация Z = {G, R, S} из §2.1 плана: score = 100 -
@@ -194,14 +263,14 @@ func (s *SensitivityScore) Score(
 		// худшую сторону: выбор отдаётся нодам с известным давлением и
 		// остальным плагинам score-фазы.
 		neutral := (fwk.MinNodeScore + fwk.MaxNodeScore) / 2
-		klog.InfoS("SensitivityScore.Score: no fresh metrics for node, neutral score",
+		klog.InfoS(s.Name()+".Score: no fresh metrics for node, neutral score",
 			"pod", pod.Name, "node", nodeName, "score", neutral)
 		return neutral, nil
 	}
 
 	score := interferenceScore(jobProfile, pressure, w)
 
-	klog.InfoS("SensitivityScore.Score called",
+	klog.InfoS(s.Name()+".Score called",
 		"pod", pod.Name, "node", nodeName,
 		"jobProfile", jobProfile, "pressure", pressure, "score", score)
 
@@ -219,19 +288,34 @@ func interferenceScore(s sensitivityVector, p nodePressure, w scoreWeights) int6
 	axis := func(base, sens, sv, pv float64) float64 {
 		return (base + sens*sv) * pv
 	}
-	interference := axis(w.Base.LLC, w.Sens.LLC, s.LLC, p.LLC) +
-		axis(w.Base.NUMA, w.Sens.NUMA, s.NUMA, p.NUMA) +
-		axis(w.Base.Net, w.Sens.Net, s.Net, p.Net) +
-		axis(w.Base.IO, w.Sens.IO, s.IO, p.IO)
+	llc := axis(w.Base.LLC, w.Sens.LLC, s.LLC, p.LLC)
+	numa := axis(w.Base.NUMA, w.Sens.NUMA, s.NUMA, p.NUMA)
+	net := axis(w.Base.Net, w.Sens.Net, s.Net, p.Net)
+	io := axis(w.Base.IO, w.Sens.IO, s.IO, p.IO)
 
-	// Знаменатель — теоретический максимум: все участвующие оси горячие
-	// (pressure=100) у полностью чувствительной задачи (s=1, т.е. base+sens
-	// целиком). Нормирует в [0, 100] при любом наборе включённых осей.
-	maxPossible := (w.Base.LLC + w.Sens.LLC + w.Base.NUMA + w.Sens.NUMA +
-		w.Base.Net + w.Sens.Net + w.Base.IO + w.Sens.IO) * 100
 	var normalized float64
-	if maxPossible > 0 {
-		normalized = interference / maxPossible // в [0,1] при разумных весах
+	if w.Aggregation == aggregationMax {
+		// CalibratedMaxPressure: избегаем самой дорогой измеренной оси,
+		// а не суммы. no-S и max обязаны получать один и тот же base-вектор.
+		interference := max(llc, numa, net, io)
+		maxAxis := max(
+			w.Base.LLC+w.Sens.LLC,
+			w.Base.NUMA+w.Sens.NUMA,
+			w.Base.Net+w.Sens.Net,
+			w.Base.IO+w.Sens.IO,
+		) * 100
+		if maxAxis > 0 {
+			normalized = interference / maxAxis
+		}
+	} else {
+		interference := llc + numa + net + io
+		// Знаменатель — теоретический максимум: все участвующие оси горячие
+		// (pressure=100) у полностью чувствительной задачи (s=1).
+		maxPossible := (w.Base.LLC + w.Sens.LLC + w.Base.NUMA + w.Sens.NUMA +
+			w.Base.Net + w.Sens.Net + w.Base.IO + w.Sens.IO) * 100
+		if maxPossible > 0 {
+			normalized = interference / maxPossible // в [0,1] при разумных весах
+		}
 	}
 
 	score := int64(100 - normalized*100)
@@ -283,26 +367,43 @@ func extractSensitivityVector(annotations map[string]string) sensitivityVector {
 	}
 }
 
-// New - конструктор. Как и в MVP, аргументы плагина не используются
-// (_ runtime.Object) — конфигурация целиком через REDIS_ADDR (метрики) и
-// weightsFilePath/ConfigMap (веса, без codegen/scheme-регистрации args-типа,
-// см. pkg/podstate для того же паттерна "плагин без Args" в этом
-// репозитории).
-func New(ctx context.Context, _ runtime.Object, h fwk.Handle) (fwk.Plugin, error) {
+// New - конструктор основного профиля. Аргументы плагина не используются:
+// конфигурация целиком через REDIS_ADDR и weightsFilePath/ConfigMap.
+func New(ctx context.Context, obj runtime.Object, h fwk.Handle) (fwk.Plugin, error) {
+	return newPlugin(ctx, obj, h, Name, "")
+}
+
+// NewNoSensitivity — калиброванная сумма без вектора S (base-only).
+func NewNoSensitivity(ctx context.Context, obj runtime.Object, h fwk.Handle) (fwk.Plugin, error) {
+	return newPlugin(ctx, obj, h, NoSensitivityName, variantNoSensitivity)
+}
+
+// NewNoBase — только надбавка чувствительности, без базовой цены оси.
+func NewNoBase(ctx context.Context, obj runtime.Object, h fwk.Handle) (fwk.Plugin, error) {
+	return newPlugin(ctx, obj, h, NoBaseName, variantNoBase)
+}
+
+// NewMaxPressure — калиброванное избегание максимальной цены давления.
+func NewMaxPressure(ctx context.Context, obj runtime.Object, h fwk.Handle) (fwk.Plugin, error) {
+	return newPlugin(ctx, obj, h, MaxPressureName, variantMaxPressure)
+}
+
+func newPlugin(ctx context.Context, _ runtime.Object, h fwk.Handle, name, variant string) (fwk.Plugin, error) {
 	addr := os.Getenv(redisAddrEnv)
 	if addr == "" {
 		addr = defaultRedisAddr
 	}
 
 	s := &SensitivityScore{
-		handle:  h,
-		redis:   newRedisMetricsSource(addr),
-		metrics: make(nodeMetrics),
-		weights: defaultWeights(),
+		handle:     h,
+		redis:      newRedisMetricsSource(addr),
+		name:       name,
+		variantKey: variant,
+		metrics:    make(nodeMetrics),
+		weights:    defaultWeightsForVariant(variant),
 	}
 
 	go s.refreshLoop(ctx)
-
 	return s, nil
 }
 
@@ -350,10 +451,19 @@ func (s *SensitivityScore) reloadWeights() {
 		return // нет файла весов — остаёмся на дефолтных/предыдущих валидных
 	}
 
-	w, err := parseWeights(data)
+	w, variants, err := parseWeightDocument(data)
 	if err != nil {
 		klog.ErrorS(err, "failed to parse sensitivity weights file")
 		return
+	}
+	if s.variantKey != "" {
+		var ok bool
+		w, ok = variants[s.variantKey]
+		if !ok {
+			klog.ErrorS(fmt.Errorf("variant %s is missing", s.variantKey),
+				"failed to select sensitivity weight variant", "plugin", s.Name())
+			return
+		}
 	}
 
 	s.mu.Lock()
@@ -371,6 +481,7 @@ func (s *SensitivityScore) reloadWeights() {
 	if first || changed {
 		// По этой строке на живом кластере видно, что калибровка доехала.
 		klog.InfoS("sensitivity weights loaded",
-			"base", w.Base, "sensitivity", w.Sens)
+			"plugin", s.Name(), "variant", s.variantKey,
+			"base", w.Base, "sensitivity", w.Sens, "aggregation", w.Aggregation)
 	}
 }

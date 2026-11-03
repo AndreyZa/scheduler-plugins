@@ -145,3 +145,121 @@ func TestReloadWeightsLogsFirstLoadEvenWhenEqualToDefaults(t *testing.T) {
 		t.Fatalf("смена весов обязана логироваться, получено %d", got)
 	}
 }
+
+func TestParseWeightDocumentVariants(t *testing.T) {
+	data := []byte(`{
+		"base":{"io":0.2},"sensitivity":{"io":0.8},
+		"variants":{
+			"ss-no-sensitivity":{"base":{"io":1.0}},
+			"ss-no-base":{"sensitivity":{"io":2.0}},
+			"max-pressure":{"base":{"io":1.0},"aggregation":"max"}
+		}
+	}`)
+	root, variants, err := parseWeightDocument(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root.Aggregation != aggregationSum {
+		t.Fatalf("root aggregation = %q, want sum", root.Aggregation)
+	}
+	if got := variants[variantNoSensitivity].Base.IO; got != 1.0 {
+		t.Fatalf("no-S base.io = %v, want 1", got)
+	}
+	if got := variants[variantNoBase].Sens.IO; got != 2.0 {
+		t.Fatalf("no-base sensitivity.io = %v, want 2", got)
+	}
+	if got := variants[variantMaxPressure].Aggregation; got != aggregationMax {
+		t.Fatalf("max aggregation = %q, want max", got)
+	}
+}
+
+func TestParseWeightDocumentRejectsInvalidVariant(t *testing.T) {
+	for name, data := range map[string]string{
+		"zero":        `{"variants":{"max-pressure":{"base":{},"sensitivity":{}}}}`,
+		"aggregation": `{"variants":{"max-pressure":{"base":{"io":1},"aggregation":"median"}}`,
+		"max-no-base": `{"variants":{"max-pressure":{"sensitivity":{"io":1},"aggregation":"max"}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, err := parseWeightDocument([]byte(data)); err == nil {
+				t.Fatalf("invalid variant must be rejected: %s", data)
+			}
+		})
+	}
+}
+
+func TestInterferenceScoreMaxPressureDiffersFromSum(t *testing.T) {
+	w := scoreWeights{Base: weights{LLC: 1, IO: 1}, Aggregation: aggregationMax}
+	pod := sensitivityVector{}               // no-S: low и high не меняют решение
+	llcHot := nodePressure{LLC: 100, IO: 10} // max=100, sum=110
+	ioHot := nodePressure{LLC: 10, IO: 90}   // max=90, sum=100
+	if got := interferenceScore(pod, llcHot, w); got >= interferenceScore(pod, ioHot, w) {
+		t.Fatalf("max-pressure must avoid max-priced axis: llcHot=%d ioHot=%d", got,
+			interferenceScore(pod, ioHot, w))
+	}
+	high := sensitivityVector{LLC: 1, IO: 1}
+	if got := interferenceScore(high, llcHot, w); got != interferenceScore(pod, llcHot, w) {
+		t.Fatalf("no-S must not depend on S: low=%d high=%d",
+			interferenceScore(pod, llcHot, w), got)
+	}
+}
+
+func TestInterferenceScoreNoBaseNeedsSensitivity(t *testing.T) {
+	w := scoreWeights{Sens: weights{IO: 1}}
+	storm := nodePressure{IO: 100}
+	if got := interferenceScore(sensitivityVector{}, storm, w); got != 100 {
+		t.Fatalf("no-base with low-S must be blind: got %d", got)
+	}
+	if got := interferenceScore(sensitivityVector{IO: 1}, storm, w); got != 0 {
+		t.Fatalf("no-base with high-S must charge pressure: got %d", got)
+	}
+}
+
+func TestReloadWeightsSelectsIndependentVariants(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "weights.json")
+	data := []byte(`{"base":{"io":0.2},"variants":{
+		"ss-no-sensitivity":{"base":{"io":1.0}},
+		"ss-no-base":{"sensitivity":{"io":2.0}},
+		"max-pressure":{"base":{"io":1.0},"aggregation":"max"}
+	}}`)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	orig := weightsFilePath
+	weightsFilePath = path
+	defer func() { weightsFilePath = orig }()
+
+	noS := &SensitivityScore{name: NoSensitivityName, variantKey: variantNoSensitivity,
+		weights: defaultWeightsForVariant(variantNoSensitivity)}
+	noBase := &SensitivityScore{name: NoBaseName, variantKey: variantNoBase,
+		weights: defaultWeightsForVariant(variantNoBase)}
+	maxP := &SensitivityScore{name: MaxPressureName, variantKey: variantMaxPressure,
+		weights: defaultWeightsForVariant(variantMaxPressure)}
+	noS.reloadWeights()
+	noBase.reloadWeights()
+	maxP.reloadWeights()
+	if noS.weights.Base.IO != 1 || noS.weights.Sens.IO != 0 {
+		t.Errorf("no-S selected wrong weights: %+v", noS.weights)
+	}
+	if noBase.weights.Sens.IO != 2 || noBase.weights.Base.IO != 0 {
+		t.Errorf("no-base selected wrong weights: %+v", noBase.weights)
+	}
+	if maxP.weights.Base.IO != 1 || maxP.weights.Aggregation != aggregationMax {
+		t.Errorf("max selected wrong weights: %+v", maxP.weights)
+	}
+}
+
+func TestVariantNames(t *testing.T) {
+	for name, want := range map[string]string{
+		NoSensitivityName: NoSensitivityName,
+		NoBaseName:        NoBaseName,
+		MaxPressureName:   MaxPressureName,
+	} {
+		if got := (&SensitivityScore{name: name}).Name(); got != want {
+			t.Errorf("Name() = %q, want %q", got, want)
+		}
+	}
+	if got := (&SensitivityScore{}).Name(); got != Name {
+		t.Errorf("empty legacy name = %q, want %q", got, Name)
+	}
+}
