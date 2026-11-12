@@ -65,7 +65,7 @@ jobs:
         run: CGO_ENABLED=0 go build -o "$RUNNER_TEMP/kube-scheduler" cmd/scheduler/main.go
 
       - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+        run: bash hack/govulncheck.sh
 
   release:
     name: релиз образа
